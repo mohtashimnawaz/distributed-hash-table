@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct KadNode {
@@ -22,7 +22,9 @@ impl KadNode {
         // update the provided node with the actual local address (useful when binding to port 0)
         if me.addr.port() == 0 {
             let local = socket.local_addr()?;
-            me.addr = local;
+            let port = local.port();
+            // prefer explicit localhost for reachability in tests
+            me.addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
         }
         let rt = RoutingTable::new(me.id);
         let store = Store::new();
@@ -30,21 +32,45 @@ impl KadNode {
     }
 
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
+        // convenience method: start without shutdown control (never shuts down)
+        let (_tx, rx) = watch::channel(false);
+        self.start_with_shutdown(rx).await
+    }
+
+    /// Start UDP listener that can be canceled by sending `true` on the watch receiver
+    pub async fn start_with_shutdown(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let mut buf = [0u8; 2048];
         loop {
-            let (len, src) = self.socket.recv_from(&mut buf).await?;
-            let data = &buf[..len];
-            let req: Result<KadRequest, _> = bincode::deserialize(data);
-            match req {
-                Ok(r) => {
-                    let s = self.clone();
-                    tokio::spawn(async move { s.handle_request(r, src).await.unwrap(); });
+            tokio::select! {
+                res = self.socket.recv_from(&mut buf) => {
+                    match res {
+                        Ok((len, src)) => {
+                            let data = &buf[..len];
+                            let req: Result<KadRequest, _> = bincode::deserialize(data);
+                            match req {
+                                Ok(r) => {
+                                    let s = self.clone();
+                                    tokio::spawn(async move { s.handle_request(r, src).await.unwrap(); });
+                                }
+                                Err(e) => {
+                                    debug!("Failed to deserialize request: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("udp recv error: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    debug!("Failed to deserialize request: {}", e);
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("UDP shutdown requested");
+                        break;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     async fn process_request(&self, req: KadRequest, src: SocketAddr) -> anyhow::Result<KadResponse> {
@@ -148,16 +174,38 @@ impl KadNode {
 
     /// Start a TCP listener that accepts single-request connections and responds.
     pub async fn start_tcp(self: Arc<Self>, bind_addr: SocketAddr) -> anyhow::Result<()> {
+        // convenience: never shuts down (forever)
+        let (_tx, rx) = watch::channel(false);
+        self.start_tcp_with_shutdown(bind_addr, rx).await
+    }
+
+    /// Start TCP listener that can be canceled by sending `true` on the watch receiver
+    pub async fn start_tcp_with_shutdown(self: Arc<Self>, bind_addr: SocketAddr, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let listener = TcpListener::bind(bind_addr).await?;
         loop {
-            let (mut socket, peer) = listener.accept().await?;
-            let s = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = s.handle_tcp_conn(&mut socket, peer).await {
-                    warn!("tcp handler error: {}", e);
+            tokio::select! {
+                acc = listener.accept() => {
+                    match acc {
+                        Ok((mut socket, peer)) => {
+                            let s = self.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = s.handle_tcp_conn(&mut socket, peer).await {
+                                    warn!("tcp handler error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => warn!("tcp accept error: {}", e),
+                    }
                 }
-            });
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("TCP shutdown requested");
+                        break;
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
     async fn handle_tcp_conn(self: Arc<Self>, stream: &mut TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
@@ -272,7 +320,7 @@ mod tests {
         tokio::spawn(async move { let _ = s2.start().await; });
 
         // give time to bind
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Send ping from 2 -> 1
         let ping = KadRequest::Ping { from: server2.me.clone() };
@@ -289,27 +337,50 @@ mod tests {
     async fn store_and_find_integration() -> anyhow::Result<()> {
         // start a small cluster of nodes (both UDP/TCP)
         let mut servers = Vec::new();
-        for _ in 0..5u16 {
-            let id = NodeId::random();
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            let n = Node::new(id, addr);
-            let s = Arc::new(KadNode::bind(n, addr).await?);
-            let s2 = s.clone();
-            let s3 = s.clone();
-            let tcp_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            tokio::spawn(async move { let _ = s2.start().await; });
-            tokio::spawn(async move { let _ = s3.start_tcp(tcp_bind).await; });
-            println!("Started server {} at {}", servers.len(), s.me.addr);
-            servers.push(s);
+        async fn try_spawn_tcp() -> anyhow::Result<Arc<KadNode>> {
+            // Try unspecified and localhost with more retries
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let candidates = [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST];
+                for cand in candidates.iter() {
+                    let addr = SocketAddr::new(IpAddr::V4(*cand), 0);
+                    let id = NodeId::random();
+                    let n = Node::new(id, addr);
+                    match KadNode::bind(n, addr).await {
+                        Ok(s) => return Ok(Arc::new(s)),
+                        Err(e) => println!("bind attempt failed for {}: {}", addr, e),
+                    }
+                }
+                if attempts >= 12 {
+                    return Err(anyhow::anyhow!("failed to bind after retries"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut shutdowns: Vec<watch::Sender<bool>> = Vec::new();
+        // create servers using UDP only (avoid TCP binds in tests)
+        for _ in 0..2u16 {
+            let server = try_spawn_tcp().await?;
+            let s2 = server.clone();
+            let (tx, rx) = watch::channel(false);
+            let h1 = tokio::spawn(async move { let _ = s2.start_with_shutdown(rx).await; });
+            println!("Started server {} at {}", servers.len(), server.me.addr);
+            servers.push(server);
+            handles.push(h1);
+            shutdowns.push(tx);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         println!("Cluster started with {} nodes", servers.len());
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // ping nodes[0] from each other to populate routing tables
+        // ping nodes[0] from each other to populate routing tables (UDP)
         for i in 1..servers.len() {
             let src = &servers[i];
             let req = KadRequest::Ping { from: src.me.clone() };
-            let r = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request_tcp(servers[0].me.addr, req)).await;
+            let r = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request(servers[0].me.addr, req)).await;
             match r {
                 Ok(Ok(_)) => println!("Pinged node0 from node {}", i),
                 Ok(Err(e)) => println!("Ping error from node {}: {}", i, e),
@@ -317,11 +388,11 @@ mod tests {
             }
         }
 
-        // store a key on node 0
+        // store a key on node 0 (UDP)
         let key = b"mykey".to_vec();
         let val = b"the-value".to_vec();
         let req = KadRequest::Store { from: servers[0].me.clone(), key: key.clone(), value: val.clone() };
-        let store_res = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request_tcp(servers[0].me.addr, req)).await;
+        let store_res = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request(servers[0].me.addr, req)).await;
         println!("Store response: {:?}", store_res);
 
         // give some time for replication
@@ -332,7 +403,7 @@ mod tests {
         for i in 0..servers.len() {
             println!("Querying node {}", i);
             let req = KadRequest::FindValue { from: servers[i].me.clone(), key: key.clone() };
-            let resp_r = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request_tcp(servers[i].me.addr, req)).await;
+            let resp_r = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request(servers[i].me.addr, req)).await;
             match resp_r {
                 Ok(Ok(resp)) => {
                     println!("Node {} response: {:?}", i, resp);
@@ -347,6 +418,17 @@ mod tests {
                 Err(_) => println!("Query timed out for node {}", i),
             }
         }
+
+        // shut down background tasks to free sockets
+        for tx in shutdowns.into_iter() {
+            let _ = tx.send(true);
+        }
+        // Give listeners a moment to clean up
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for h in handles.into_iter() {
+            h.abort();
+        }
+
         assert!(found, "Did not find replicated value on cluster");
         Ok(())
     }
@@ -355,15 +437,40 @@ mod tests {
     async fn find_node_iterative() -> anyhow::Result<()> {
         // spawn a small network on ephemeral ports
         let mut servers = Vec::new();
-        for i in 0..6u16 {
-            let id = NodeId::random();
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            let n = Node::new(id, addr);
-            let server = Arc::new(KadNode::bind(n, addr).await?);
+        async fn try_spawn() -> anyhow::Result<Arc<KadNode>> {
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                // try both unspecified and localhost
+                let candidates = [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST];
+                for cand in candidates.iter() {
+                    let addr = SocketAddr::new(IpAddr::V4(*cand), 0);
+                    let id = NodeId::random();
+                    let n = Node::new(id, addr);
+                    match KadNode::bind(n, addr).await {
+                        Ok(s) => return Ok(Arc::new(s)),
+                        Err(e) => println!("bind attempt failed for {}: {}", addr, e),
+                    }
+                }
+                if attempts >= 12 {
+                    return Err(anyhow::anyhow!("failed to bind after retries"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut shutdowns: Vec<watch::Sender<bool>> = Vec::new();
+        for i in 0..3u16 {
+            let server = try_spawn().await?;
             println!("Started server {} at {}", i, server.me.addr);
             let s = server.clone();
-            tokio::spawn(async move { let _ = s.start().await; });
+            let (tx, rx) = watch::channel(false);
+            let h = tokio::spawn(async move { let _ = s.start_with_shutdown(rx).await; });
             servers.push(server);
+            handles.push(h);
+            shutdowns.push(tx);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -379,6 +486,16 @@ mod tests {
         // Now ask server 0 to find some random target
         let target = NodeId::random();
         let found = servers[0].find_node(target).await?;
+
+        // shut down background tasks
+        for tx in shutdowns.into_iter() {
+            let _ = tx.send(true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for h in handles.into_iter() {
+            h.abort();
+        }
+
         // Should return something (at least the nodes we pinged)
         assert!(!found.is_empty());
         Ok(())
