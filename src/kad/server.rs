@@ -1,12 +1,13 @@
 use crate::kad::{KadRequest, KadResponse, Node, NodeId, RoutingTable, Store};
-use log::warn;
 use bincode;
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::convert::TryInto;
 
 pub struct KadNode {
     pub me: Node,
@@ -41,7 +42,7 @@ impl KadNode {
         }
     }
 
-    async fn handle_request(self: Arc<Self>, req: KadRequest, src: SocketAddr) -> anyhow::Result<()> {
+    async fn process_request(&self, req: KadRequest, src: SocketAddr) -> anyhow::Result<KadResponse> {
         match req {
             KadRequest::Ping { from } => {
                 info!("Received Ping from {}", from.addr);
@@ -49,19 +50,14 @@ impl KadNode {
                 let mut rt = self.rt.lock().await;
                 rt.add_node(from.clone());
                 drop(rt);
-                // respond Pong
-                let resp = KadResponse::Pong { from: self.me.clone() };
-                let b = bincode::serialize(&resp)?;
-                let _ = self.socket.send_to(&b, src).await?;
+                Ok(KadResponse::Pong { from: self.me.clone() })
             }
             KadRequest::FindNode { from, target } => {
                 let mut rt = self.rt.lock().await;
                 let closest = rt.find_closest(&target, 8);
                 rt.add_node(from.clone());
                 drop(rt);
-                let resp = KadResponse::Nodes { from: self.me.clone(), nodes: closest };
-                let b = bincode::serialize(&resp)?;
-                let _ = self.socket.send_to(&b, src).await?;
+                Ok(KadResponse::Nodes { from: self.me.clone(), nodes: closest })
             }
             KadRequest::FindValue { from, key } => {
                 // Check local store first
@@ -70,18 +66,12 @@ impl KadNode {
                 rt.add_node(from.clone());
                 drop(rt);
                 if let Some(v) = val {
-                    // return value
-                    let resp = KadResponse::Value { from: self.me.clone(), value: Some(v) };
-                    let b = bincode::serialize(&resp)?;
-                    let _ = self.socket.send_to(&b, src).await?;
+                    Ok(KadResponse::Value { from: self.me.clone(), value: Some(v) })
                 } else {
-                    // return nodes to consult
                     let rt = self.rt.lock().await;
                     let closest = rt.find_closest(&NodeId::random(), 8); // target unknown; could hash key
                     drop(rt);
-                    let resp = KadResponse::Nodes { from: self.me.clone(), nodes: closest };
-                    let b = bincode::serialize(&resp)?;
-                    let _ = self.socket.send_to(&b, src).await?;
+                    Ok(KadResponse::Nodes { from: self.me.clone(), nodes: closest })
                 }
             }
             KadRequest::Store { from, key, value } => {
@@ -94,18 +84,22 @@ impl KadNode {
                 let rt2 = self.rt.lock().await;
                 let closest = rt2.find_closest(&NodeId::random(), 8); // should hash key to id
                 drop(rt2);
-                        for n in closest.iter() {
+                for n in closest.iter() {
                     // best-effort replicate, log failure
                     if let Err(e) = KadNode::send_request(n.addr, KadRequest::Store { from: self.me.clone(), key: key.clone(), value: value.clone() }).await {
                         warn!("replication to {} failed: {}", n.addr, e);
                     }
                 }
-                // Ack
-                let resp = KadResponse::Pong { from: self.me.clone() };
-                let b = bincode::serialize(&resp)?;
-                let _ = self.socket.send_to(&b, src).await?;
+
+                Ok(KadResponse::Pong { from: self.me.clone() })
             }
         }
+    }
+
+    async fn handle_request(self: Arc<Self>, req: KadRequest, src: SocketAddr) -> anyhow::Result<()> {
+        let resp = self.process_request(req, src).await?;
+        let b = bincode::serialize(&resp)?;
+        let _ = self.socket.send_to(&b, src).await?;
         Ok(())
     }
 
@@ -117,6 +111,53 @@ impl KadNode {
         let (len, _) = socket.recv_from(&mut buf).await?;
         let resp: KadResponse = bincode::deserialize(&buf[..len])?;
         Ok(resp)
+    }
+
+    /// Send a KadRequest over TCP (length-prefixed bincode frame)
+    pub async fn send_request_tcp(addr: SocketAddr, req: KadRequest) -> anyhow::Result<KadResponse> {
+        let mut stream = TcpStream::connect(addr).await?;
+        let payload = bincode::serialize(&req)?;
+        let len = (payload.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&payload).await?;
+        // read response length
+        let mut lenb = [0u8; 4];
+        stream.read_exact(&mut lenb).await?;
+        let rlen = u32::from_be_bytes(lenb) as usize;
+        let mut respb = vec![0u8; rlen];
+        stream.read_exact(&mut respb).await?;
+        let resp: KadResponse = bincode::deserialize(&respb)?;
+        Ok(resp)
+    }
+
+    /// Start a TCP listener that accepts single-request connections and responds.
+    pub async fn start_tcp(self: Arc<Self>, bind_addr: SocketAddr) -> anyhow::Result<()> {
+        let listener = TcpListener::bind(bind_addr).await?;
+        loop {
+            let (mut socket, peer) = listener.accept().await?;
+            let s = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = s.handle_tcp_conn(&mut socket, peer).await {
+                    warn!("tcp handler error: {}", e);
+                }
+            });
+        }
+    }
+
+    async fn handle_tcp_conn(self: Arc<Self>, stream: &mut TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
+        // read len
+        let mut lenb = [0u8; 4];
+        stream.read_exact(&mut lenb).await?;
+        let rlen = u32::from_be_bytes(lenb) as usize;
+        let mut payload = vec![0u8; rlen];
+        stream.read_exact(&mut payload).await?;
+        let req: KadRequest = bincode::deserialize(&payload)?;
+        let resp = self.process_request(req, peer).await?;
+        let respb = bincode::serialize(&resp)?;
+        let lenr = (respb.len() as u32).to_be_bytes();
+        stream.write_all(&lenr).await?;
+        stream.write_all(&respb).await?;
+        Ok(())
     }
 
     /// Iterative FIND_NODE (simple variant)
@@ -220,6 +261,35 @@ mod tests {
         match resp {
             KadResponse::Pong { from } => assert_eq!(from.addr.port(), 14000),
             _ => panic!("unexpected"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_ping_between_nodes() -> anyhow::Result<()> {
+        let id1 = NodeId::random();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 16000);
+        let n1 = Node::new(id1, addr1);
+        let server1 = Arc::new(KadNode::bind(n1, addr1).await?);
+        let s1 = server1.clone();
+        tokio::spawn(async move { let _ = s1.start_tcp(addr1).await; });
+        // give listener a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let id2 = NodeId::random();
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 16001);
+        let n2 = Node::new(id2, addr2);
+        let server2 = Arc::new(KadNode::bind(n2, addr2).await?);
+        let s2 = server2.clone();
+        tokio::spawn(async move { let _ = s2.start_tcp(addr2).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let ping = KadRequest::Ping { from: Node::new(id2, addr2) };
+        let resp = KadNode::send_request_tcp(addr1, ping).await?;
+        match resp {
+            KadResponse::Pong { from } => assert_eq!(from.addr.port(), 16000),
+            _ => panic!("unexpected tcp"),
         }
 
         Ok(())
