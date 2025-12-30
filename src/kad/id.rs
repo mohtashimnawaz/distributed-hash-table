@@ -1,8 +1,9 @@
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 /// 256-bit NodeId
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub [u8; 32]);
 
 impl NodeId {

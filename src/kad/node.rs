@@ -1,7 +1,8 @@
 use crate::kad::NodeId;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub addr: SocketAddr,
