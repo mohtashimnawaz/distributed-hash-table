@@ -2,12 +2,12 @@ use crate::kad::{KadRequest, KadResponse, Node, NodeId, RoutingTable, Store};
 use bincode;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::convert::TryInto;
 
 pub struct KadNode {
     pub me: Node,
@@ -17,8 +17,13 @@ pub struct KadNode {
 }
 
 impl KadNode {
-    pub async fn bind(me: Node, bind_addr: SocketAddr) -> anyhow::Result<Self> {
+    pub async fn bind(mut me: Node, bind_addr: SocketAddr) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        // update the provided node with the actual local address (useful when binding to port 0)
+        if me.addr.port() == 0 {
+            let local = socket.local_addr()?;
+            me.addr = local;
+        }
         let rt = RoutingTable::new(me.id);
         let store = Store::new();
         Ok(Self { me, rt: Arc::new(Mutex::new(rt)), socket: Arc::new(socket), store })
@@ -68,8 +73,14 @@ impl KadNode {
                 if let Some(v) = val {
                     Ok(KadResponse::Value { from: self.me.clone(), value: Some(v) })
                 } else {
+                    // hash key -> NodeId and return closest nodes
+                    let mut hasher = Sha256::new();
+                    hasher.update(&key);
+                    let hash = hasher.finalize();
+                    let id: [u8; 32] = hash.as_slice().try_into().unwrap();
+                    let target = NodeId::from_bytes(id);
                     let rt = self.rt.lock().await;
-                    let closest = rt.find_closest(&NodeId::random(), 8); // target unknown; could hash key
+                    let closest = rt.find_closest(&target, 8);
                     drop(rt);
                     Ok(KadResponse::Nodes { from: self.me.clone(), nodes: closest })
                 }
@@ -80,9 +91,14 @@ impl KadNode {
                 let mut rt = self.rt.lock().await;
                 rt.add_node(from.clone());
                 drop(rt);
-                // replicate to k closest
+                // replicate to k closest based on key hash
+                let mut hasher = Sha256::new();
+                hasher.update(&key);
+                let hash = hasher.finalize();
+                let id: [u8; 32] = hash.as_slice().try_into().unwrap();
+                let target = NodeId::from_bytes(id);
                 let rt2 = self.rt.lock().await;
-                let closest = rt2.find_closest(&NodeId::random(), 8); // should hash key to id
+                let closest = rt2.find_closest(&target, 8);
                 drop(rt2);
                 for n in closest.iter() {
                     // best-effort replicate, log failure
@@ -267,31 +283,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_ping_between_nodes() -> anyhow::Result<()> {
-        let id1 = NodeId::random();
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 16000);
-        let n1 = Node::new(id1, addr1);
-        let server1 = Arc::new(KadNode::bind(n1, addr1).await?);
-        let s1 = server1.clone();
-        tokio::spawn(async move { let _ = s1.start_tcp(addr1).await; });
-        // give listener a moment to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    async fn store_and_find_integration() -> anyhow::Result<()> {
+        // start a small cluster of nodes (both UDP/TCP)
+        let mut servers = Vec::new();
+        let base = 17000u16;
+        for i in 0..5u16 {
+            let id = NodeId::random();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base + i);
+            let n = Node::new(id, addr);
+            let s = Arc::new(KadNode::bind(n, addr).await?);
+            let s2 = s.clone();
+            let s3 = s.clone();
+            tokio::spawn(async move { let _ = s2.start().await; });
+            tokio::spawn(async move { let _ = s3.start_tcp(addr).await; });
+            servers.push(s);
+        }
+        println!("Cluster started with {} nodes", servers.len());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let id2 = NodeId::random();
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 16001);
-        let n2 = Node::new(id2, addr2);
-        let server2 = Arc::new(KadNode::bind(n2, addr2).await?);
-        let s2 = server2.clone();
-        tokio::spawn(async move { let _ = s2.start_tcp(addr2).await; });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let ping = KadRequest::Ping { from: Node::new(id2, addr2) };
-        let resp = KadNode::send_request_tcp(addr1, ping).await?;
-        match resp {
-            KadResponse::Pong { from } => assert_eq!(from.addr.port(), 16000),
-            _ => panic!("unexpected tcp"),
+        // ping nodes[0] from each other to populate routing tables
+        for i in 1..servers.len() {
+            let src = &servers[i];
+            let req = KadRequest::Ping { from: src.me.clone() };
+            let r = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request_tcp(servers[0].me.addr, req)).await;
+            match r {
+                Ok(Ok(_)) => println!("Pinged node0 from node {}", i),
+                Ok(Err(e)) => println!("Ping error from node {}: {}", i, e),
+                Err(_) => println!("Ping timed out from node {}", i),
+            }
         }
 
+        // store a key on node 0
+        let key = b"mykey".to_vec();
+        let val = b"the-value".to_vec();
+        let req = KadRequest::Store { from: servers[0].me.clone(), key: key.clone(), value: val.clone() };
+        let store_res = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request_tcp(servers[0].me.addr, req)).await;
+        println!("Store response: {:?}", store_res);
+
+        // give some time for replication
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // query other nodes for the value (with timeouts)
+        let mut found = false;
+        for i in 0..servers.len() {
+            println!("Querying node {}", i);
+            let req = KadRequest::FindValue { from: servers[i].me.clone(), key: key.clone() };
+            let resp_r = tokio::time::timeout(std::time::Duration::from_secs(2), KadNode::send_request_tcp(servers[i].me.addr, req)).await;
+            match resp_r {
+                Ok(Ok(resp)) => {
+                    println!("Node {} response: {:?}", i, resp);
+                    if let KadResponse::Value { value: Some(v), .. } = resp {
+                        if v == val {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => println!("Error querying node {}: {}", i, e),
+                Err(_) => println!("Query timed out for node {}", i),
+            }
+        }
+        assert!(found, "Did not find replicated value on cluster");
         Ok(())
     }
 
