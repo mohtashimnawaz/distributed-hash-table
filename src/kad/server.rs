@@ -1,4 +1,5 @@
-use crate::kad::{KadRequest, KadResponse, Node, NodeId, RoutingTable};
+use crate::kad::{KadRequest, KadResponse, Node, NodeId, RoutingTable, Store};
+use log::warn;
 use bincode;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,15 @@ pub struct KadNode {
     pub me: Node,
     rt: Arc<Mutex<RoutingTable>>,
     socket: Arc<UdpSocket>,
+    store: Store,
 }
 
 impl KadNode {
     pub async fn bind(me: Node, bind_addr: SocketAddr) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
         let rt = RoutingTable::new(me.id);
-        Ok(Self { me, rt: Arc::new(Mutex::new(rt)), socket: Arc::new(socket) })
+        let store = Store::new();
+        Ok(Self { me, rt: Arc::new(Mutex::new(rt)), socket: Arc::new(socket), store })
     }
 
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
@@ -60,20 +63,44 @@ impl KadNode {
                 let b = bincode::serialize(&resp)?;
                 let _ = self.socket.send_to(&b, src).await?;
             }
-            KadRequest::FindValue { from, key: _ } => {
-                // Not implemented value storage yet
+            KadRequest::FindValue { from, key } => {
+                // Check local store first
+                let val = self.store.get(&key).await;
                 let mut rt = self.rt.lock().await;
                 rt.add_node(from.clone());
                 drop(rt);
-                let resp = KadResponse::Value { from: self.me.clone(), value: None };
-                let b = bincode::serialize(&resp)?;
-                let _ = self.socket.send_to(&b, src).await?;
+                if let Some(v) = val {
+                    // return value
+                    let resp = KadResponse::Value { from: self.me.clone(), value: Some(v) };
+                    let b = bincode::serialize(&resp)?;
+                    let _ = self.socket.send_to(&b, src).await?;
+                } else {
+                    // return nodes to consult
+                    let rt = self.rt.lock().await;
+                    let closest = rt.find_closest(&NodeId::random(), 8); // target unknown; could hash key
+                    drop(rt);
+                    let resp = KadResponse::Nodes { from: self.me.clone(), nodes: closest };
+                    let b = bincode::serialize(&resp)?;
+                    let _ = self.socket.send_to(&b, src).await?;
+                }
             }
-            KadRequest::Store { from, .. } => {
+            KadRequest::Store { from, key, value } => {
+                // store locally
+                self.store.put(key.clone(), value.clone()).await;
                 let mut rt = self.rt.lock().await;
                 rt.add_node(from.clone());
                 drop(rt);
-                // Ack w/ Pong
+                // replicate to k closest
+                let rt2 = self.rt.lock().await;
+                let closest = rt2.find_closest(&NodeId::random(), 8); // should hash key to id
+                drop(rt2);
+                        for n in closest.iter() {
+                    // best-effort replicate, log failure
+                    if let Err(e) = KadNode::send_request(n.addr, KadRequest::Store { from: self.me.clone(), key: key.clone(), value: value.clone() }).await {
+                        warn!("replication to {} failed: {}", n.addr, e);
+                    }
+                }
+                // Ack
                 let resp = KadResponse::Pong { from: self.me.clone() };
                 let b = bincode::serialize(&resp)?;
                 let _ = self.socket.send_to(&b, src).await?;
@@ -94,6 +121,10 @@ impl KadNode {
 
     /// Iterative FIND_NODE (simple variant)
     pub async fn find_node(&self, target: NodeId) -> anyhow::Result<Vec<Node>> {
+        // add self to routing table and heartbeat
+        let mut rt = self.rt.lock().await;
+        rt.add_node(self.me.clone());
+        drop(rt);
         use futures::future::join_all;
         use std::collections::{HashMap, HashSet};
 
