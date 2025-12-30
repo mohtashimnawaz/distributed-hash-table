@@ -27,7 +27,9 @@ cargo run -- serve 14001
 
 Running integration tests (flaky / opt-in)
 
-Integration tests that start multiple in-process network listeners are marked `#[ignore]` because they can be flaky on some platforms (macOS) when run under the test harness. To run them explicitly:
+Integration tests that start multiple in-process network listeners are marked `#[ignore]` because they can be flaky on some platforms when run under the test harness. CI is configured to run the ignored tests in a dedicated job so they can be executed on stable runners.
+
+Run locally (opt-in):
 
 ```bash
 # run only ignored tests directly
@@ -39,6 +41,10 @@ cargo integration
 # or run the helper script
 ./scripts/run-integration-tests.sh
 ```
+
+Run in CI:
+
+- The repository contains `.github/workflows/ci.yml` which runs unit tests and then runs the ignored integration tests on Ubuntu and macOS runners.
 
 Design notes
 - This is a minimal, educational implementation: it does not implement persistence, routing table bucket splitting, replacement strategies in full, or cryptographic node identity.
