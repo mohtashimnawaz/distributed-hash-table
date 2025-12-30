@@ -91,6 +91,74 @@ impl KadNode {
         let resp: KadResponse = bincode::deserialize(&buf[..len])?;
         Ok(resp)
     }
+
+    /// Iterative FIND_NODE (simple variant)
+    pub async fn find_node(&self, target: NodeId) -> anyhow::Result<Vec<Node>> {
+        use futures::future::join_all;
+        use std::collections::{HashMap, HashSet};
+
+        const ALPHA: usize = 3;
+        const K_RETURN: usize = 20;
+
+        let mut seen: HashMap<Vec<u8>, Node> = HashMap::new();
+        let mut queried: HashSet<Vec<u8>> = HashSet::new();
+
+        // seed shortlist
+        let shortlist = { self.rt.lock().await.find_closest(&target, K_RETURN) };
+        for n in shortlist.iter() {
+            seen.insert(n.id.0.to_vec(), n.clone());
+        }
+
+        loop {
+            // pick up to ALPHA closest unqueried nodes
+            let mut candidates: Vec<Node> = seen.values()
+                .filter(|n| !queried.contains(&n.id.0.to_vec()))
+                .cloned()
+                .collect();
+            candidates.sort_by_key(|n| n.id.xor(&target));
+            if candidates.is_empty() {
+                break;
+            }
+            let round: Vec<Node> = candidates.into_iter().take(ALPHA).collect();
+
+            // send FindNode to all in round
+            let futures = round.iter().map(|n| {
+                let addr = n.addr;
+                let req = KadRequest::FindNode { from: self.me.clone(), target };
+                async move { KadNode::send_request(addr, req).await }
+            });
+            let results = join_all(futures).await;
+
+            let mut any_new = false;
+            for (i, res) in results.into_iter().enumerate() {
+                let node = &round[i];
+                queried.insert(node.id.0.to_vec());
+                if let Ok(resp) = res {
+                    match resp {
+                        KadResponse::Nodes { nodes, .. } => {
+                            for n in nodes {
+                                if !seen.contains_key(&n.id.0.to_vec()) {
+                                    seen.insert(n.id.0.to_vec(), n.clone());
+                                    any_new = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !any_new {
+                break;
+            }
+        }
+
+        // return up to K_RETURN closest
+        let mut out: Vec<Node> = seen.values().cloned().collect();
+        out.sort_by_key(|n| n.id.xor(&target));
+        out.truncate(K_RETURN);
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +191,37 @@ mod tests {
             _ => panic!("unexpected"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_node_iterative() -> anyhow::Result<()> {
+        // spawn a small network
+        let mut servers = Vec::new();
+        let base_port = 15000u16;
+        for i in 0..6u16 {
+            let id = NodeId::random();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base_port + i);
+            let n = Node::new(id, addr);
+            let server = Arc::new(KadNode::bind(n, addr).await?);
+            let s = server.clone();
+            tokio::spawn(async move { let _ = s.start().await; });
+            servers.push(server);
+        }
+
+        // Ping nodes to populate routing tables
+        for i in 1..servers.len() {
+            let src = &servers[i];
+            let dest_addr = servers[0].me.addr;
+            let ping = KadRequest::Ping { from: src.me.clone() };
+            let _ = KadNode::send_request(dest_addr, ping).await?;
+        }
+
+        // Now ask server 0 to find some random target
+        let target = NodeId::random();
+        let found = servers[0].find_node(target).await?;
+        // Should return something (at least the nodes we pinged)
+        assert!(!found.is_empty());
         Ok(())
     }
 }
