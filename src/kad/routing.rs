@@ -160,34 +160,29 @@ mod tests {
 
     #[test]
     fn replacement_cache_promotes_on_dead() {
-        let me = NodeId::random();
-        let mut rt = RoutingTable::new(me);
-
-        // choose two ids that map to the same bucket
-        let id_base = NodeId::random();
-        // Force all added nodes to be close to id_base by replacing their ids' last byte
+        // Test KBucket replacement/promotion behavior directly
+        let mut bucket = KBucket::new();
         let mut nodes = Vec::new();
         for i in 0..(K as u8 + 3) {
-            let mut b = NodeId::random().0;
-            b[31] = i;
-            let id = NodeId::from_bytes(b);
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20000 + i as u16);
+            let id = NodeId::random();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30000 + i as u16);
             nodes.push(Node::new(id, addr));
         }
 
-        // Insert first K nodes -> fill bucket
+        // Fill bucket
         for n in nodes.iter().take(K) {
-            rt.add_node(n.clone());
+            bucket.touch(n.clone());
         }
-        // Adding extra nodes should go into replacement cache
+        assert_eq!(bucket.len(), K);
+
+        // Add extras -> should land in replacement cache
         for n in nodes.iter().skip(K) {
-            rt.add_node(n.clone());
+            bucket.touch(n.clone());
         }
 
-        // pick the oldest in that bucket and remove it
+        // Remove oldest (first inserted) and promote
         let oldest_id = nodes.first().unwrap().id;
-        let promoted = rt.remove_dead(&oldest_id).unwrap();
-        // promoted should be one of the nodes we added in the replacement cache
+        let promoted = bucket.remove_and_promote(&oldest_id).unwrap();
         assert!(nodes.iter().any(|n| n.id == promoted.id));
     }
 }
