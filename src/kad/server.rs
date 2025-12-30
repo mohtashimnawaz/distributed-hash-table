@@ -286,16 +286,16 @@ mod tests {
     async fn store_and_find_integration() -> anyhow::Result<()> {
         // start a small cluster of nodes (both UDP/TCP)
         let mut servers = Vec::new();
-        let base = 17000u16;
-        for i in 0..5u16 {
+        for _ in 0..5u16 {
             let id = NodeId::random();
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base + i);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
             let n = Node::new(id, addr);
             let s = Arc::new(KadNode::bind(n, addr).await?);
             let s2 = s.clone();
             let s3 = s.clone();
+            let tcp_addr = s.me.addr; // copy before moving s into closures
             tokio::spawn(async move { let _ = s2.start().await; });
-            tokio::spawn(async move { let _ = s3.start_tcp(addr).await; });
+            tokio::spawn(async move { let _ = s3.start_tcp(tcp_addr).await; });
             servers.push(s);
         }
         println!("Cluster started with {} nodes", servers.len());
@@ -349,18 +349,19 @@ mod tests {
 
     #[tokio::test]
     async fn find_node_iterative() -> anyhow::Result<()> {
-        // spawn a small network
+        // spawn a small network on ephemeral ports
         let mut servers = Vec::new();
-        let base_port = 15000u16;
-        for i in 0..6u16 {
+        for _ in 0..6u16 {
             let id = NodeId::random();
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base_port + i);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
             let n = Node::new(id, addr);
             let server = Arc::new(KadNode::bind(n, addr).await?);
             let s = server.clone();
             tokio::spawn(async move { let _ = s.start().await; });
             servers.push(server);
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Ping nodes to populate routing tables
         for i in 1..servers.len() {
