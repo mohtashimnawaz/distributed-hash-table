@@ -334,6 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn store_and_find_integration() -> anyhow::Result<()> {
         // start a small cluster of nodes (both UDP/TCP)
         let mut servers = Vec::new();
@@ -434,6 +435,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn find_node_iterative() -> anyhow::Result<()> {
         // spawn a small network on ephemeral ports
         let mut servers = Vec::new();

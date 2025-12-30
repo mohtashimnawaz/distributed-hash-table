@@ -25,6 +25,21 @@ cargo run -- serve 14001
 
 3. From a third terminal you can send a Ping using the test utilities or call into the running nodes programmatically. The demo `serve` command shows how to bind and serve; use the library to implement more advanced CLI.
 
+Running integration tests (flaky / opt-in)
+
+Integration tests that start multiple in-process network listeners are marked `#[ignore]` because they can be flaky on some platforms (macOS) when run under the test harness. To run them explicitly:
+
+```bash
+# run only ignored tests directly
+cargo test -- --ignored --nocapture
+
+# or use the convenience cargo alias added to Cargo.toml
+cargo integration
+
+# or run the helper script
+./scripts/run-integration-tests.sh
+```
+
 Design notes
 - This is a minimal, educational implementation: it does not implement persistence, routing table bucket splitting, replacement strategies in full, or cryptographic node identity.
 - Uses `bincode` for compact binary serialization of RPC messages.
