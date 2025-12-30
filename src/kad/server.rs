@@ -258,24 +258,27 @@ mod tests {
     #[tokio::test]
     async fn ping_between_nodes() -> anyhow::Result<()> {
         let id1 = NodeId::random();
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14000);
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let n1 = Node::new(id1, addr1);
         let server1 = Arc::new(KadNode::bind(n1, addr1).await?);
         let s1 = server1.clone();
         tokio::spawn(async move { let _ = s1.start().await; });
 
         let id2 = NodeId::random();
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14001);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let n2 = Node::new(id2, addr2);
         let server2 = Arc::new(KadNode::bind(n2, addr2).await?);
         let s2 = server2.clone();
         tokio::spawn(async move { let _ = s2.start().await; });
 
+        // give time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         // Send ping from 2 -> 1
-        let ping = KadRequest::Ping { from: Node::new(id2, addr2) };
-        let resp = KadNode::send_request(addr1, ping).await?;
+        let ping = KadRequest::Ping { from: server2.me.clone() };
+        let resp = KadNode::send_request(server1.me.addr, ping).await?;
         match resp {
-            KadResponse::Pong { from } => assert_eq!(from.addr.port(), 14000),
+            KadResponse::Pong { from } => assert_eq!(from.addr.port(), server1.me.addr.port()),
             _ => panic!("unexpected"),
         }
 
@@ -293,9 +296,10 @@ mod tests {
             let s = Arc::new(KadNode::bind(n, addr).await?);
             let s2 = s.clone();
             let s3 = s.clone();
-            let tcp_addr = s.me.addr; // copy before moving s into closures
+            let tcp_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
             tokio::spawn(async move { let _ = s2.start().await; });
-            tokio::spawn(async move { let _ = s3.start_tcp(tcp_addr).await; });
+            tokio::spawn(async move { let _ = s3.start_tcp(tcp_bind).await; });
+            println!("Started server {} at {}", servers.len(), s.me.addr);
             servers.push(s);
         }
         println!("Cluster started with {} nodes", servers.len());
@@ -351,11 +355,12 @@ mod tests {
     async fn find_node_iterative() -> anyhow::Result<()> {
         // spawn a small network on ephemeral ports
         let mut servers = Vec::new();
-        for _ in 0..6u16 {
+        for i in 0..6u16 {
             let id = NodeId::random();
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
             let n = Node::new(id, addr);
             let server = Arc::new(KadNode::bind(n, addr).await?);
+            println!("Started server {} at {}", i, server.me.addr);
             let s = server.clone();
             tokio::spawn(async move { let _ = s.start().await; });
             servers.push(server);
